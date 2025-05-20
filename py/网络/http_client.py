@@ -4,7 +4,6 @@ from typing import Dict, Any, Optional, Tuple
 from urllib.parse import urljoin
 import logging
 import asyncio
-import re
 
 
 class HttpClient:
@@ -64,7 +63,7 @@ class HttpClient:
         verify_ssl: bool = True,
         http2: bool = False,
         follow_redirects: bool = True,
-        proxies: Optional[str] = None,
+        proxies: str = None,
         logger: Optional[logging.Logger] = None
     ):
         """
@@ -80,7 +79,7 @@ class HttpClient:
             verify_ssl (bool): 是否验证 SSL 证书
             http2 (bool): 是否启用 HTTP/2
             follow_redirects (bool): 是否自动跟随重定向
-            proxies (str): 代理设置，如 "http://proxy:8080
+            proxies (Dict[str, str]): 代理设置，如 {"http": "http://proxy:8080", "https": "http://proxy:8080"}
         """
         self.base_url = base_url
         self.timeout = timeout
@@ -206,6 +205,7 @@ class HttpClient:
             'headers': headers,
             'cookies': cookies,
             'timeout': timeout if timeout is not None else self.timeout,
+            'verify': verify_ssl if verify_ssl is not None else self.verify_ssl,
             'follow_redirects': follow_redirects if follow_redirects is not None else self.follow_redirects,
             **kwargs
         }
@@ -231,9 +231,6 @@ class HttpClient:
                 return response
                 
             except (httpx.RequestError, httpx.HTTPStatusError) as e:
-                # 304 状态码不重试
-                if e.response.status_code == 304:
-                    return e.response
                 last_error = e
                 retries += 1
                 
@@ -359,7 +356,8 @@ class AsyncHttpClient:
         verify_ssl: bool = True,
         http2: bool = False,
         follow_redirects: bool = True,
-        proxies: Optional[str] = None
+        proxies: str = None,
+        logger: Optional[logging.Logger] = None
     ):
         """初始化异步 HTTP 客户端"""
         self.base_url = base_url
@@ -440,7 +438,6 @@ class AsyncHttpClient:
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[Dict[str, str]] = None,
         timeout: Optional[int] = None,
-        verify_ssl: Optional[bool] = None,
         follow_redirects: Optional[bool] = None,
         raise_for_status: bool = True,
         **kwargs
@@ -457,7 +454,6 @@ class AsyncHttpClient:
             headers (Dict[str, str]): 请求头
             cookies (Dict[str, str]): Cookies
             timeout (int): 请求超时时间（秒）
-            verify_ssl (bool): 是否验证 SSL 证书
             follow_redirects (bool): 是否自动跟随重定向
             raise_for_status (bool): 是否为 HTTP 错误状态码抛出异常
             **kwargs: 传递给 httpx.request 的其他参数
@@ -503,9 +499,6 @@ class AsyncHttpClient:
                 return response
                 
             except (httpx.RequestError, httpx.HTTPStatusError) as e:
-                # 304 状态码不重试
-                if e.response.status_code == 304:
-                    return e.response
                 last_error = e
                 retries += 1
                 
@@ -588,35 +581,3 @@ class AsyncHttpClient:
                     f.write(chunk)
         
         self.logger.info(f"文件已下载到: {file_path}")
-
-def normalize_etag(etag: str) -> str:
-    """
-    标准化 ETag 值，去掉结尾以 "-" 开头的任意字符串
-    
-    Args:
-        etag: 原始 ETag 值，如 "W/\"abc123-tr\"" 或 "\"abc123-xyz\""
-    
-    Returns:
-        标准化后的 ETag 值，如 "W/\"abc123\"" 或 "\"abc123\""
-    """
-    if not etag:
-        return etag
-    
-    # 处理弱 ETag (以 W/ 开头)
-    is_weak = etag.startswith('W/')
-    
-    # 提取实际的 ETag 值 (去掉 W/ 和引号)
-    if is_weak:
-        etag_value = etag[2:].strip('"')
-    else:
-        etag_value = etag.strip('"')
-    
-    # 使用正则表达式去掉结尾以 "-" 开头的字符串
-    # 这会匹配字符串末尾的 "-" 及其后面的所有字符
-    etag_value = re.sub(r'-[^-]*$', '', etag_value)
-    
-    # 重新组装 ETag
-    if is_weak:
-        return f'W/"{etag_value}"'
-    else:
-        return f'"{etag_value}"'
