@@ -1,583 +1,280 @@
 import httpx
-import time
-from typing import Dict, Any, Optional, Tuple
-from urllib.parse import urljoin
-import logging
 import asyncio
+import socket
+import time
+import sqlite3
+from typing import Dict, Tuple, Optional, ClassVar
+import logging
+from utils.logger import logger
+# 关闭第三方库的 DEBUG 日志
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
 
-
-class HttpClient:
-    """
-    基于 httpx 的可重用 HTTP 客户端类
+class PersistentDNSCache:
+    """持久化 DNS 缓存管理器"""
     
-    特性:
-    - 自动重试失败的请求
-    - 可配置的超时设置
-    - 统一的错误处理
-    - 支持 JSON 请求和响应
-    - 支持请求和响应拦截器
-    - 支持会话管理
-    - 支持自定义基础 URL
-
-    使用示例:
-    # 创建一个基本的 HTTP 客户端
-    client = HttpClient(
-        base_url="https://api.example.com",
-        timeout=10,
-        max_retries=2
-    )
-
-    # 发送 GET 请求
-    response = client.get("/users")
-    print(f"状态码: {response.status_code}")
-    print(f"响应内容: {response.text}")
-
-    # 发送带参数的 GET 请求
-    users = client.get_json("/users", params={"page": 1, "limit": 10})
-    print(f"用户列表: {users}")
-
-    # 发送 POST 请求
-    response = client.post(
-        "/users",
-        json={"name": "John Doe", "email": "john@example.com"}
-    )
-    print(f"创建用户响应: {response.json()}")
-
-    # 使用上下文管理器
-    with HttpClient(base_url="https://api.example.com") as client:
-        response = client.get("/status")
-        print(f"API 状态: {response.text}")
-
-    # 下载文件
-    client.download_file("https://example.com/files/document.pdf", "document.pdf")
-    """
+    def __init__(self, db_path: str = "dns_cache.db"):
+        self.db_path = db_path
+        self._init_db()
     
-    def __init__(
-        self,
-        base_url: str = "",
-        timeout: int = 30,
-        max_retries: int = 3,
-        retry_delay: int = 1,
-        headers: Optional[Dict[str, str]] = None,
-        cookies: Optional[Dict[str, str]] = None,
-        verify_ssl: bool = True,
-        http2: bool = False,
-        follow_redirects: bool = True,
-        proxies: str = None,
-        logger: Optional[logging.Logger] = None
-    ):
-        """
-        初始化 HTTP 客户端
+    def _init_db(self):
+        """初始化数据库"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dns_cache (
+                hostname TEXT PRIMARY KEY,
+                ip TEXT NOT NULL,
+                expire_time REAL NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ DNS 缓存数据库初始化完成: {self.db_path}")
+    
+    def get(self, hostname: str) -> Optional[str]:
+        """获取缓存的 IP"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         
-        参数:
-            base_url (str): API 基础 URL
-            timeout (int): 请求超时时间（秒）
-            max_retries (int): 最大重试次数
-            retry_delay (int): 重试间隔（秒）
-            headers (Dict[str, str]): 默认请求头
-            cookies (Dict[str, str]): 默认 cookies
-            verify_ssl (bool): 是否验证 SSL 证书
-            http2 (bool): 是否启用 HTTP/2
-            follow_redirects (bool): 是否自动跟随重定向
-            proxies (Dict[str, str]): 代理设置，如 {"http": "http://proxy:8080", "https": "http://proxy:8080"}
-        """
-        self.base_url = base_url
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-        self.default_headers = headers or {}
-        self.default_cookies = cookies or {}
-        self.verify_ssl = verify_ssl
-        self.http2 = http2
-        self.follow_redirects = follow_redirects
-        self.proxies = proxies
-
-        # 使用传入的 logger 或创建一个新的
-        self.logger = logger or logging.getLogger(__name__)
-        
-        # 创建 httpx 客户端
-        self.client = httpx.Client(
-            timeout=timeout,
-            headers=self.default_headers,
-            cookies=self.default_cookies,
-            verify=verify_ssl,
-            http2=http2,
-            follow_redirects=follow_redirects,
-            proxy=proxies
+        cursor.execute(
+            "SELECT ip, expire_time FROM dns_cache WHERE hostname = ?",
+            (hostname,)
         )
+        result = cursor.fetchone()
+        conn.close()
         
-        # 请求和响应拦截器
-        self.request_interceptors = []
-        self.response_interceptors = []
-    
-    def __enter__(self):
-        """支持上下文管理器模式"""
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """退出上下文管理器时关闭客户端"""
-        self.close()
-    
-    def close(self):
-        """关闭 HTTP 客户端"""
-        if self.client:
-            self.client.close()
-    
-    def add_request_interceptor(self, interceptor):
-        """
-        添加请求拦截器
+        if result:
+            ip, expire_time = result
+            if time.time() < expire_time:
+                logger.debug(f"✅ DNS 缓存命中 (数据库): {hostname} -> {ip}")
+                return ip
+            else:
+                # 过期，删除
+                self.delete(hostname)
+                logger.info(f"⏰ DNS 缓存过期 (数据库): {hostname}")
         
-        拦截器函数应接受 (url, method, kwargs) 参数并返回修改后的 (url, method, kwargs)
-        """
-        self.request_interceptors.append(interceptor)
+        return None
     
-    def add_response_interceptor(self, interceptor):
-        """
-        添加响应拦截器
+    def set(self, hostname: str, ip: str, ttl: int):
+        """设置 DNS 缓存"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         
-        拦截器函数应接受 (response) 参数并返回修改后的 response
-        """
-        self.response_interceptors.append(interceptor)
-    
-    def _prepare_url(self, url: str) -> str:
-        """准备完整的 URL"""
-        if url.startswith(('http://', 'https://')):
-            return url
-        return urljoin(self.base_url, url)
-    
-    def _apply_request_interceptors(self, url: str, method: str, kwargs: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
-        """应用所有请求拦截器"""
-        for interceptor in self.request_interceptors:
-            url, method, kwargs = interceptor(url, method, kwargs)
-        return url, method, kwargs
-    
-    def _apply_response_interceptors(self, response: httpx.Response) -> httpx.Response:
-        """应用所有响应拦截器"""
-        for interceptor in self.response_interceptors:
-            response = interceptor(response)
-        return response
-    
-    def request(
-        self,
-        method: str,
-        url: str,
-        params: Optional[Dict[str, Any]] = None,
-        data: Optional[Any] = None,
-        json: Optional[Dict[str, Any]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        cookies: Optional[Dict[str, str]] = None,
-        timeout: Optional[int] = None,
-        verify_ssl: Optional[bool] = None,
-        follow_redirects: Optional[bool] = None,
-        raise_for_status: bool = True,
-        **kwargs
-    ) -> httpx.Response:
-        """
-        发送 HTTP 请求
+        expire_time = time.time() + ttl
+        now = time.time()
         
-        参数:
-            method (str): HTTP 方法 (GET, POST, PUT, DELETE 等)
-            url (str): 请求 URL
-            params (Dict[str, Any]): URL 查询参数
-            data (Any): 请求体数据
-            json (Dict[str, Any]): JSON 请求体
-            headers (Dict[str, str]): 请求头
-            cookies (Dict[str, str]): Cookies
-            timeout (int): 请求超时时间（秒）
-            verify_ssl (bool): 是否验证 SSL 证书
-            follow_redirects (bool): 是否自动跟随重定向
-            raise_for_status (bool): 是否为 HTTP 错误状态码抛出异常
-            **kwargs: 传递给 httpx.request 的其他参数
-            
-        返回:
-            httpx.Response: HTTP 响应对象
-            
-        抛出:
-            httpx.RequestError: 请求错误
-            httpx.HTTPStatusError: HTTP 状态错误（如果 raise_for_status=True）
-        """
-        # 准备请求参数
-        full_url = self._prepare_url(url)
-        request_kwargs = {
-            'params': params,
-            'data': data,
-            'json': json,
-            'headers': headers,
-            'cookies': cookies,
-            'timeout': timeout if timeout is not None else self.timeout,
-            'verify': verify_ssl if verify_ssl is not None else self.verify_ssl,
-            'follow_redirects': follow_redirects if follow_redirects is not None else self.follow_redirects,
-            **kwargs
+        cursor.execute("""
+            INSERT OR REPLACE INTO dns_cache 
+            (hostname, ip, expire_time, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (hostname, ip, expire_time, now, now))
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"💾 DNS 缓存已保存 (数据库): {hostname} -> {ip} (TTL: {ttl}s)")
+    
+    def delete(self, hostname: str):
+        """删除缓存"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM dns_cache WHERE hostname = ?", (hostname,))
+        conn.commit()
+        conn.close()
+    
+    def clear(self):
+        """清空所有缓存"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM dns_cache")
+        conn.commit()
+        conn.close()
+        logger.info("🧹 DNS 缓存已清空 (数据库)")
+    
+    def cleanup_expired(self):
+        """清理过期缓存"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM dns_cache WHERE expire_time < ?", (time.time(),))
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        if deleted > 0:
+            logger.info(f"🧹 清理了 {deleted} 条过期 DNS 缓存")
+        return deleted
+    
+    def get_stats(self) -> dict:
+        """获取缓存统计"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # 总数
+        cursor.execute("SELECT COUNT(*) FROM dns_cache")
+        total = cursor.fetchone()[0]
+        
+        # 有效数量
+        cursor.execute("SELECT COUNT(*) FROM dns_cache WHERE expire_time > ?", (time.time(),))
+        valid = cursor.fetchone()[0]
+        
+        # 详细信息
+        cursor.execute("SELECT hostname, ip, expire_time FROM dns_cache")
+        domains = {}
+        current_time = time.time()
+        
+        for hostname, ip, expire_time in cursor.fetchall():
+            domains[hostname] = {
+                "ip": ip,
+                "expires_in": max(0, int(expire_time - current_time)),
+                "is_valid": expire_time > current_time
+            }
+        
+        conn.close()
+        
+        return {
+            "total_cached": total,
+            "valid_entries": valid,
+            "expired_entries": total - valid,
+            "domains": domains
         }
+
+
+
+class HttpClient(httpx.AsyncClient):
+    """带持久化 DNS 缓存和自动重试的 httpx.AsyncClient"""
+    
+    # 类级别的缓存管理器
+    _dns_cache: ClassVar[Optional[PersistentDNSCache]] = None
+    _global_lock: ClassVar[asyncio.Lock] = None
+    
+    def __init__(self, dns_ttl: int = 600, dns_cache_db: str = "dns_cache.db", *args, **kwargs):
+        """
+        Args:
+            dns_ttl: DNS 缓存时间（秒），默认 10 分钟
+            dns_cache_db: DNS 缓存数据库路径
+        """
+        super().__init__(*args, **kwargs)
+        self.dns_ttl = dns_ttl
         
-        # 应用请求拦截器
-        full_url, method, request_kwargs = self._apply_request_interceptors(full_url, method, request_kwargs)
+        # 初始化全局缓存管理器（只初始化一次）
+        if HttpClient._dns_cache is None:
+            HttpClient._dns_cache = PersistentDNSCache(dns_cache_db)
+            HttpClient._dns_cache.cleanup_expired()  # 启动时清理过期缓存
+        
+        # 初始化全局锁
+        if HttpClient._global_lock is None:
+            HttpClient._global_lock = asyncio.Lock()
+        
+        stats = self._dns_cache.get_stats()
+        logger.info(f"✅ HttpClient 初始化完成 (缓存: {stats['valid_entries']}/{stats['total_cached']} 条有效)")
+    
+    async def _resolve_dns(self, hostname: str) -> Optional[str]:
+        """解析 DNS（使用持久化缓存）"""
+        async with self._global_lock:
+            # 检查缓存
+            ip = self._dns_cache.get(hostname)
+            if ip:
+                return ip
+            
+            # DNS 解析（带重试）
+            for attempt in range(3):
+                try:
+                    loop = asyncio.get_event_loop()
+                    ip = await loop.run_in_executor(None, socket.gethostbyname, hostname)
+                    
+                    # 存入持久化缓存
+                    self._dns_cache.set(hostname, ip, self.dns_ttl)
+                    logger.info(f"🔍 DNS 解析成功: {hostname} -> {ip}")
+                    return ip
+                
+                except socket.gaierror:
+                    logger.warning(f"❌ DNS 解析失败 (尝试 {attempt+1}/3): {hostname}")
+                    if attempt < 2:
+                        await asyncio.sleep(2 ** attempt)
+            
+            return None
+    
+    async def request(self, method: str, url: str, max_retries: int = 3, 
+                     retry_delay: float = 1.0, **kwargs) -> httpx.Response:
+        """发送 HTTP 请求（带自动重试）"""
+        from urllib.parse import urlparse, urlunparse
+        
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        
+        # DNS 解析
+        ip = await self._resolve_dns(hostname)
+        if not ip:
+            logger.error(f"❌ DNS 解析失败，使用原始 URL: {url}")
+            target_url = url
+        else:
+            # 替换主机名为 IP
+            target_url = urlunparse((
+                parsed.scheme,
+                f"{ip}:{parsed.port}" if parsed.port else ip,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+            # 设置 Host 头
+            if 'headers' not in kwargs:
+                kwargs['headers'] = {}
+            kwargs['headers']['Host'] = hostname
         
         # 重试逻辑
-        retries = 0
         last_error = None
-        
-        while retries <= self.max_retries:
+        for attempt in range(max_retries):
             try:
-                response = self.client.request(method, full_url, **request_kwargs)
-                
-                # 应用响应拦截器
-                response = self._apply_response_interceptors(response)
-                
-                # 检查状态码
-                if raise_for_status:
-                    response.raise_for_status()
-                
+                logger.info(f"🚀 发送请求 (尝试 {attempt+1}/{max_retries}): {method} {target_url[:80]}...")
+                response = await super().request(method, target_url, **kwargs)
+                logger.info(f"✅ 请求成功: {response.status_code}")
                 return response
-                
-            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
                 last_error = e
-                retries += 1
+                logger.warning(f"⚠️ 请求失败 (尝试 {attempt+1}/{max_retries}): {e}")
                 
-                # 如果达到最大重试次数，抛出最后一个错误
-                if retries > self.max_retries:
-                    self.logger.error(f"请求失败，已达到最大重试次数: {str(e)}")
-                    raise
-                
-                # 记录重试信息
-                self.logger.warning(f"请求失败，正在重试 ({retries}/{self.max_retries}): {str(e)}")
-                
-                # 重试延迟
-                time.sleep(self.retry_delay)
-    
-    def get(self, url: str, **kwargs) -> httpx.Response:
-        """发送 GET 请求"""
-        return self.request('GET', url, **kwargs)
-    
-    def post(self, url: str, **kwargs) -> httpx.Response:
-        """发送 POST 请求"""
-        return self.request('POST', url, **kwargs)
-    
-    def put(self, url: str, **kwargs) -> httpx.Response:
-        """发送 PUT 请求"""
-        return self.request('PUT', url, **kwargs)
-    
-    def delete(self, url: str, **kwargs) -> httpx.Response:
-        """发送 DELETE 请求"""
-        return self.request('DELETE', url, **kwargs)
-    
-    def patch(self, url: str, **kwargs) -> httpx.Response:
-        """发送 PATCH 请求"""
-        return self.request('PATCH', url, **kwargs)
-    
-    def head(self, url: str, **kwargs) -> httpx.Response:
-        """发送 HEAD 请求"""
-        return self.request('HEAD', url, **kwargs)
-    
-    def options(self, url: str, **kwargs) -> httpx.Response:
-        """发送 OPTIONS 请求"""
-        return self.request('OPTIONS', url, **kwargs)
-    
-    def get_json(self, url: str, **kwargs) -> Any:
-        """
-        发送 GET 请求并返回 JSON 响应
+                if attempt < max_retries - 1:
+                    delay = retry_delay * (2 ** attempt)
+                    logger.info(f"⏳ 等待 {delay} 秒后重试...")
+                    await asyncio.sleep(delay)
         
-        返回:
-            Any: 解析后的 JSON 数据
-        """
-        response = self.get(url, **kwargs)
-        return response.json()
+        logger.error(f"❌ 请求最终失败: {last_error}")
+        raise last_error
     
-    def post_json(self, url: str, json_data: Dict[str, Any], **kwargs) -> Any:
-        """
-        发送 JSON POST 请求并返回 JSON 响应
-        
-        参数:
-            url (str): 请求 URL
-            json_data (Dict[str, Any]): 要发送的 JSON 数据
-            **kwargs: 其他请求参数
-            
-        返回:
-            Any: 解析后的 JSON 数据
-        """
-        response = self.post(url, json=json_data, **kwargs)
-        return response.json()
+    # 便捷方法
+    async def get(self, url: str, **kwargs):
+        return await self.request("GET", url, **kwargs)
     
-    def download_file(self, url: str, file_path: str, **kwargs) -> None:
-        """
-        下载文件并保存到指定路径
-        
-        参数:
-            url (str): 文件 URL
-            file_path (str): 保存文件的路径
-            **kwargs: 其他请求参数
-        """
-        with self.get(url, **kwargs) as response:
-            with open(file_path, 'wb') as f:
-                for chunk in response.iter_bytes(chunk_size=8192):
-                    f.write(chunk)
-        
-        self.logger.info(f"文件已下载到: {file_path}")
+    async def post(self, url: str, **kwargs):
+        return await self.request("POST", url, **kwargs)
     
-    def create_async_client(self) -> 'AsyncHttpClient':
-        """
-        创建具有相同配置的异步 HTTP 客户端
-        
-        返回:
-            AsyncHttpClient: 异步 HTTP 客户端实例
-        """
-        from httpx import AsyncClient
-        
-        # 导入 AsyncHttpClient 类 (需要在文件末尾定义)
-        return AsyncHttpClient(
-            base_url=self.base_url,
-            timeout=self.timeout,
-            max_retries=self.max_retries,
-            retry_delay=self.retry_delay,
-            headers=self.default_headers,
-            cookies=self.default_cookies,
-            verify_ssl=self.verify_ssl,
-            http2=self.http2,
-            follow_redirects=self.follow_redirects,
-            proxies=self.proxies
-        )
-
-
-class AsyncHttpClient:
-    """
-    基于 httpx 的异步 HTTP 客户端类
+    async def put(self, url: str, **kwargs):
+        return await self.request("PUT", url, **kwargs)
     
-    特性与 HttpClient 类似，但支持异步操作
-    """
+    async def delete(self, url: str, **kwargs):
+        return await self.request("DELETE", url, **kwargs)
     
-    def __init__(
-        self,
-        base_url: str = "",
-        timeout: int = 30,
-        max_retries: int = 3,
-        retry_delay: int = 1,
-        headers: Optional[Dict[str, str]] = None,
-        cookies: Optional[Dict[str, str]] = None,
-        verify_ssl: bool = True,
-        http2: bool = False,
-        follow_redirects: bool = True,
-        proxies: str = None,
-        logger: Optional[logging.Logger] = None
-    ):
-        """初始化异步 HTTP 客户端"""
-        self.base_url = base_url
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-        self.default_headers = headers or {}
-        self.default_cookies = cookies or {}
-        self.verify_ssl = verify_ssl
-        self.http2 = http2
-        self.follow_redirects = follow_redirects
-        self.proxies = proxies
-        
-        # 创建异步 httpx 客户端
-        self.client = httpx.AsyncClient(
-            timeout=timeout,
-            headers=self.default_headers,
-            cookies=self.default_cookies,
-            verify=verify_ssl,
-            http2=http2,
-            follow_redirects=follow_redirects,
-            proxy=proxies
-        )
-        
-        # 请求和响应拦截器
-        self.request_interceptors = []
-        self.response_interceptors = []
+    @classmethod
+    def clear_dns_cache(cls):
+        """清空 DNS 缓存"""
+        if cls._dns_cache:
+            cls._dns_cache.clear()
     
-    async def __aenter__(self):
-        """支持异步上下文管理器模式"""
-        return self
+    @classmethod
+    def cleanup_expired_dns(cls):
+        """清理过期 DNS 缓存"""
+        if cls._dns_cache:
+            return cls._dns_cache.cleanup_expired()
+        return 0
     
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """退出异步上下文管理器时关闭客户端"""
-        await self.close()
-    
-    async def close(self):
-        """关闭异步 HTTP 客户端"""
-        if self.client:
-            await self.client.aclose()
-    
-    def add_request_interceptor(self, interceptor):
-        """添加请求拦截器"""
-        self.request_interceptors.append(interceptor)
-    
-    def add_response_interceptor(self, interceptor):
-        """添加响应拦截器"""
-        self.response_interceptors.append(interceptor)
-    
-    def _prepare_url(self, url: str) -> str:
-        """准备完整的 URL"""
-        if url.startswith(('http://', 'https://')):
-            return url
-        return urljoin(self.base_url, url)
-    
-    def _apply_request_interceptors(self, url: str, method: str, kwargs: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
-        """应用所有请求拦截器"""
-        for interceptor in self.request_interceptors:
-            url, method, kwargs = interceptor(url, method, kwargs)
-        return url, method, kwargs
-    
-    async def _apply_response_interceptors(self, response: httpx.Response) -> httpx.Response:
-        """应用所有响应拦截器"""
-        for interceptor in self.response_interceptors:
-            if callable(getattr(interceptor, "__call__", None)):
-                response = interceptor(response)
-            elif callable(getattr(interceptor, "__await__", None)):
-                response = await interceptor(response)
-        return response
-    
-    async def request(
-        self,
-        method: str,
-        url: str,
-        params: Optional[Dict[str, Any]] = None,
-        data: Optional[Any] = None,
-        json: Optional[Dict[str, Any]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        cookies: Optional[Dict[str, str]] = None,
-        timeout: Optional[int] = None,
-        follow_redirects: Optional[bool] = None,
-        raise_for_status: bool = True,
-        **kwargs
-    ) -> httpx.Response:
-        """
-        发送异步 HTTP 请求
-        
-        参数:
-            method (str): HTTP 方法 (GET, POST, PUT, DELETE 等)
-            url (str): 请求 URL
-            params (Dict[str, Any]): URL 查询参数
-            data (Any): 请求体数据
-            json (Dict[str, Any]): JSON 请求体
-            headers (Dict[str, str]): 请求头
-            cookies (Dict[str, str]): Cookies
-            timeout (int): 请求超时时间（秒）
-            follow_redirects (bool): 是否自动跟随重定向
-            raise_for_status (bool): 是否为 HTTP 错误状态码抛出异常
-            **kwargs: 传递给 httpx.request 的其他参数
-            
-        返回:
-            httpx.Response: HTTP 响应对象
-            
-        抛出:
-            httpx.RequestError: 请求错误
-            httpx.HTTPStatusError: HTTP 状态错误（如果 raise_for_status=True）
-        """
-        # 准备请求参数
-        full_url = self._prepare_url(url)
-        request_kwargs = {
-            'params': params,
-            'data': data,
-            'json': json,
-            'headers': headers,
-            'cookies': cookies,
-            'timeout': timeout if timeout is not None else self.timeout,
-            'follow_redirects': follow_redirects if follow_redirects is not None else self.follow_redirects,
-            **kwargs
-        }
-        
-        # 应用请求拦截器
-        full_url, method, request_kwargs = self._apply_request_interceptors(full_url, method, request_kwargs)
-        
-        # 重试逻辑
-        retries = 0
-        last_error = None
-        
-        while retries <= self.max_retries:
-            try:
-                response = await self.client.request(method, full_url, **request_kwargs)
-                
-                # 应用响应拦截器
-                response = await self._apply_response_interceptors(response)
-                
-                # 检查状态码
-                if raise_for_status:
-                    response.raise_for_status()
-                
-                return response
-                
-            except (httpx.RequestError, httpx.HTTPStatusError) as e:
-                last_error = e
-                retries += 1
-                
-                # 如果达到最大重试次数，抛出最后一个错误
-                if retries > self.max_retries:
-                    self.logger.error(f"请求失败，已达到最大重试次数: {str(e)}")
-                    raise
-                
-                # 记录重试信息
-                self.logger.warning(f"请求失败，正在重试 ({retries}/{self.max_retries}): {str(e)}")
-                
-                # 重试延迟
-                await asyncio.sleep(self.retry_delay)
-    
-    async def get(self, url: str, **kwargs) -> httpx.Response:
-        """发送异步 GET 请求"""
-        return await self.request('GET', url, **kwargs)
-    
-    async def post(self, url: str, **kwargs) -> httpx.Response:
-        """发送异步 POST 请求"""
-        return await self.request('POST', url, **kwargs)
-    
-    async def put(self, url: str, **kwargs) -> httpx.Response:
-        """发送异步 PUT 请求"""
-        return await self.request('PUT', url, **kwargs)
-    
-    async def delete(self, url: str, **kwargs) -> httpx.Response:
-        """发送异步 DELETE 请求"""
-        return await self.request('DELETE', url, **kwargs)
-    
-    async def patch(self, url: str, **kwargs) -> httpx.Response:
-        """发送异步 PATCH 请求"""
-        return await self.request('PATCH', url, **kwargs)
-    
-    async def head(self, url: str, **kwargs) -> httpx.Response:
-        """发送异步 HEAD 请求"""
-        return await self.request('HEAD', url, **kwargs)
-    
-    async def options(self, url: str, **kwargs) -> httpx.Response:
-        """发送异步 OPTIONS 请求"""
-        return await self.request('OPTIONS', url, **kwargs)
-    
-    async def get_json(self, url: str, **kwargs) -> Any:
-        """
-        发送异步 GET 请求并返回 JSON 响应
-        
-        返回:
-            Any: 解析后的 JSON 数据
-        """
-        response = await self.get(url, **kwargs)
-        return response.json()
-    
-    async def post_json(self, url: str, json_data: Dict[str, Any], **kwargs) -> Any:
-        """
-        发送异步 JSON POST 请求并返回 JSON 响应
-        
-        参数:
-            url (str): 请求 URL
-            json_data (Dict[str, Any]): 要发送的 JSON 数据
-            **kwargs: 其他请求参数
-            
-        返回:
-            Any: 解析后的 JSON 数据
-        """
-        response = await self.post(url, json=json_data, **kwargs)
-        return response.json()
-    
-    async def download_file(self, url: str, file_path: str, **kwargs) -> None:
-        """
-        异步下载文件并保存到指定路径
-        
-        参数:
-            url (str): 文件 URL
-            file_path (str): 保存文件的路径
-            **kwargs: 其他请求参数
-        """
-        async with self.get(url, **kwargs) as response:
-            with open(file_path, 'wb') as f:
-                async for chunk in response.aiter_bytes(chunk_size=8192):
-                    f.write(chunk)
-        
-        self.logger.info(f"文件已下载到: {file_path}")
+    @classmethod
+    def get_dns_stats(cls) -> dict:
+        """获取 DNS 缓存统计"""
+        if cls._dns_cache:
+            return cls._dns_cache.get_stats()
+        return {"total_cached": 0, "valid_entries": 0, "expired_entries": 0, "domains": {}}
