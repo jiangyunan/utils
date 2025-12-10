@@ -279,3 +279,101 @@ def str2timestamp(t, timezone='Asia/Shanghai', add_time=False, custom_format=Non
         raise ValueError(f"大于现在时间: {t}")
     
     return timestamp
+    
+def remove_symbols(text):
+    """
+    去除字符串中的所有符号，包括中文符号。
+
+    参数:
+    text (str): 要处理的字符串
+
+    返回:
+    str: 去除符号后的字符串
+    """
+    # 使用 Unicode 属性匹配所有符号字符
+    cleaned_text = re.sub(r'\p{P}|\p{S}', '', text)
+    return cleaned_text
+
+def is_loose_uuid(s):
+    """
+    判断字符串是否符合 UUID 格式
+    """
+    parts = s.split('-')
+    
+    # 要求有 5 段（UUID 的格式）
+    if len(parts) != 5:
+        return False
+
+    # 每段的长度要求（宽松一点）
+    expected_lengths = [6, 4, 4, 4, 6]
+    for part, min_len in zip(parts, expected_lengths):
+        if len(part) < min_len:
+            return False
+        if not all(c in '0123456789abcdefABCDEF' for c in part):
+            return False
+
+    return True
+
+def is_chinese(text: str, threshold: float = 0.1) -> bool:
+    """
+    判断文本是否为中文,空返回Ture
+    
+    Args:
+        text: 输入文本
+        threshold: 中文字符占比阈值 (0.0-1.0)，默认0.1表示中文字符超过80%就算中文
+    
+    Returns:
+        True: 是中文文本
+        False: 不是中文文本
+    """
+    if not text or not text.strip():
+        return True
+    
+    # 移除非文字
+    text = re.sub(r'[^\w]+', '', text)
+    
+    if not text:
+        return True
+    
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"  # 表情符号
+        "\U0001F300-\U0001F5FF"  # 符号和象形文字
+        "\U0001F680-\U0001F6FF"  # 交通和地图符号
+        "\U0001F1E0-\U0001F1FF"  # 旗帜
+        "\U00002702-\U000027B0"  # 装饰符号
+        #"\U000024C2-\U0001F251"  # 封闭字符包含汉字
+        "\U0001F900-\U0001F9FF"  # 补充符号和象形文字
+        "\U0001FA00-\U0001FA6F"  # 扩展A
+        "\U0001FA70-\U0001FAFF"  # 扩展B
+        "\U00002600-\U000026FF"  # 杂项符号
+        "\U00002700-\U000027BF"  # 装饰符号
+        "]+",
+        flags=re.UNICODE
+    )
+    text = emoji_pattern.sub('', text)
+    if not text:
+        return True
+    
+    # 获取前30个字符
+    text = text[:60]
+
+    # 检查是否包含日语假名
+    # 平假名: \u3040-\u309F
+    # 片假名: \u30A0-\u30FF
+    japanese_kana = re.findall(r'[\u3040-\u309F\u30A0-\u30FF]', text)
+    
+    # 如果包含假名,判断假名占比
+    if japanese_kana:
+        kana_ratio = len(japanese_kana) / len(text)
+        # 如果假名占比超过10%,认为是日语
+        if kana_ratio > 0.1:
+            return False
+    
+    # 统计简体中文字符（常用汉字范围）和数字
+    chinese_chars = re.findall(r'[\u4e00-\u9fa5\d]', text)
+    
+    # 计算中文字符占比
+    chinese_ratio = len(chinese_chars) / len(text)
+    
+    return chinese_ratio >= threshold
