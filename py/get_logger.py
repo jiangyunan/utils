@@ -41,7 +41,7 @@ class WxHandler(logging.Handler):
         #todo 发送代码
 
 class ElasticsearchHandler(logging.Handler):
-    def __init__(self, es_host=["https://m7:9200", "https://m6:9200"], index="logs", username="elastic", password="carnoc", ca_certs='ca.crt'):
+    def __init__(self, es_host=["https://es1:9200", "https://es2:9200"], index="logs", username="elastic", password="password", ca_certs='ca.crt'):
         super().__init__()
         self.es = Elasticsearch(es_host, basic_auth=(username, password), verify_certs=True, ca_certs=ca_certs)
         self.index = index
